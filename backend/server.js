@@ -7,73 +7,75 @@ const PORT = process.env.PORT || 10000;
 app.use(cors());
 app.use(express.json());
 
-const devices = [
-  {
-    id: "demo-001",
-    name: "My Phone",
-    status: "online",
-    battery: 87,
-    smsForwarding: false,
-    callForwarding: false
-  },
-  {
-    id: "demo-002",
-    name: "Test Phone",
-    status: "offline",
-    battery: 42,
-    smsForwarding: false,
-    callForwarding: false
-  }
-];
+const devices = new Map();
 
-const sms = [
-  {
-    id: 1,
-    device_id: "demo-001",
-    sender: "TEST",
-    message: "Demo SMS message",
-    time: new Date().toISOString()
-  }
-];
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, demo: true });
+  res.json({ ok: true });
 });
 
-app.get("/api/devices", (_req, res) => {
-  res.json(devices);
-});
+// Phone first-time registration
+app.post("/api/devices/register", (req, res) => {
+  const { device_id, model, battery, app_version } = req.body;
 
-app.get("/api/devices/summary", (_req, res) => {
+  if (!device_id) {
+    return res.status(400).json({ error: "device_id required" });
+  }
+
+  const device = {
+    id: device_id,
+    model: model || "Unknown",
+    battery: Number.isFinite(battery) ? battery : null,
+    app_version: app_version || "unknown",
+    status: "online",
+    last_seen: new Date().toISOString()
+  };
+
+  devices.set(device_id, device);
+
   res.json({
-    total: devices.length,
-    online: devices.filter(d => d.status === "online").length,
-    offline: devices.filter(d => d.status === "offline").length
+    ok: true,
+    device
   });
 });
 
-app.get("/api/devices/:id", (req, res) => {
-  const device = devices.find(d => d.id === req.params.id);
+// Phone heartbeat
+app.post("/api/devices/:id/heartbeat", (req, res) => {
+  const device = devices.get(req.params.id);
 
   if (!device) {
-    return res.status(404).json({ error: "Device not found" });
+    return res.status(404).json({ error: "device not registered" });
   }
 
-  res.json(device);
+  if (req.body.battery !== undefined) {
+    device.battery = Number(req.body.battery);
+  }
+
+  device.status = "online";
+  device.last_seen = new Date().toISOString();
+
+  res.json({ ok: true });
 });
 
-app.get("/api/sms", (_req, res) => {
-  res.json(sms);
+// Panel device list
+app.get("/api/devices", (_req, res) => {
+  res.json([...devices.values()]);
 });
 
-app.get("/api/forwarding-status", (_req, res) => {
+// Panel summary
+app.get("/api/devices/summary", (_req, res) => {
+  const list = [...devices.values()];
+
   res.json({
-    sms_forwarding: false,
-    call_forwarding: false,
-    demo: true
+    total: list.length,
+    online: list.filter(x => x.status === "online").length,
+    offline: list.filter(x => x.status !== "online").length
   });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Demo API running on port ${PORT}`);
+  console.log(`API running on ${PORT}`);
 });
