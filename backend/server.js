@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
+import Database from "better-sqlite3";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -13,11 +14,47 @@ app.use(cors({
 app.use(express.json());
 
 /* =========================
-   IN-MEMORY DATA
+   DATABASE
 ========================= */
 
-const devices = new Map();
-const sessions = new Map();
+const db = new Database("daddy-ji.db");
+
+db.pragma("journal_mode = WAL");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS devices (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    model TEXT,
+    battery INTEGER,
+    app_version TEXT,
+    status TEXT DEFAULT 'offline',
+    last_seen TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT,
+    type TEXT,
+    result TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sms_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT,
+    sender TEXT,
+    message TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+`);
 
 /* =========================
    HEALTH
@@ -27,19 +64,8 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     database: {
-      driver: "memory"
-    },
-    fcm: {
-      configured: false
-    }
-  });
-});
-
-app.get("/api/health", (_req, res) => {
-  res.json({
-    status: "ok",
-    database: {
-      driver: "memory"
+      driver: "sqlite",
+      connected: true
     },
     fcm: {
       configured: false
@@ -70,10 +96,14 @@ app.post("/api/customer/login", (req, res) => {
 
   const token = crypto.randomUUID();
 
-  sessions.set(token, {
-    username: String(username).trim(),
-    created_at: new Date().toISOString()
-  });
+  db.prepare(`
+    INSERT INTO sessions (token, username, created_at)
+    VALUES (?, ?, ?)
+  `).run(
+    token,
+    String(username).trim(),
+    new Date().toISOString()
+  );
 
   res.json({
     token,
@@ -82,7 +112,7 @@ app.post("/api/customer/login", (req, res) => {
 });
 
 /* =========================
-   AUTH CHECK
+   AUTH
 ========================= */
 
 function getSession(req) {
@@ -92,12 +122,15 @@ function getSession(req) {
     return null;
   }
 
-  const token = header.slice(7);
-  return sessions.get(token) || null;
+  return db.prepare(`
+    SELECT token, username, created_at
+    FROM sessions
+    WHERE token = ?
+  `).get(header.slice(7)) || null;
 }
 
 /* =========================
-   CUSTOMER INFO
+   CUSTOMER ME
 ========================= */
 
 app.get("/api/customer/me", (req, res) => {
@@ -135,20 +168,33 @@ app.post("/api/devices/register", (req, res) => {
     });
   }
 
-  const device = {
-    id: String(device_id),
-    name: model || "Android Device",
-    model: model || "Unknown",
-    battery:
-      battery !== undefined && battery !== null
-        ? Number(battery)
-        : null,
-    app_version: app_version || "unknown",
-    status: "online",
-    last_seen: new Date().toISOString()
-  };
+  const now = new Date().toISOString();
 
-  devices.set(String(device_id), device);
+  db.prepare(`
+    INSERT INTO devices
+      (id, name, model, battery, app_version, status, last_seen, created_at)
+    VALUES
+      (?, ?, ?, ?, ?, 'online', ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      model = excluded.model,
+      battery = excluded.battery,
+      app_version = excluded.app_version,
+      status = 'online',
+      last_seen = excluded.last_seen
+  `).run(
+    String(device_id),
+    model || "Android Device",
+    model || "Unknown",
+    battery != null ? Number(battery) : null,
+    app_version || "unknown",
+    now,
+    now
+  );
+
+  const device = db.prepare(`
+    SELECT * FROM devices WHERE id = ?
+  `).get(String(device_id));
 
   res.json({
     ok: true,
@@ -162,22 +208,42 @@ app.post("/api/devices/register", (req, res) => {
 
 app.post("/api/devices/:id/heartbeat", (req, res) => {
   const id = String(req.params.id);
-  const device = devices.get(id);
 
-  if (!device) {
+  const exists = db.prepare(`
+    SELECT id FROM devices WHERE id = ?
+  `).get(id);
+
+  if (!exists) {
     return res.status(404).json({
       error: "device not registered"
     });
   }
 
-  if (req.body && req.body.battery !== undefined) {
-    device.battery = Number(req.body.battery);
+  const battery =
+    req.body?.battery !== undefined
+      ? Number(req.body.battery)
+      : null;
+
+  if (battery !== null) {
+    db.prepare(`
+      UPDATE devices
+      SET battery = ?,
+          status = 'online',
+          last_seen = ?
+      WHERE id = ?
+    `).run(battery, new Date().toISOString(), id);
+  } else {
+    db.prepare(`
+      UPDATE devices
+      SET status = 'online',
+          last_seen = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), id);
   }
 
-  device.status = "online";
-  device.last_seen = new Date().toISOString();
-
-  devices.set(id, device);
+  const device = db.prepare(`
+    SELECT * FROM devices WHERE id = ?
+  `).get(id);
 
   res.json({
     ok: true,
@@ -186,11 +252,16 @@ app.post("/api/devices/:id/heartbeat", (req, res) => {
 });
 
 /* =========================
-   DEVICE LIST
+   DEVICES
 ========================= */
 
 app.get("/api/devices", (_req, res) => {
-  res.json([...devices.values()]);
+  const devices = db.prepare(`
+    SELECT * FROM devices
+    ORDER BY last_seen DESC
+  `).all();
+
+  res.json(devices);
 });
 
 /* =========================
@@ -198,12 +269,20 @@ app.get("/api/devices", (_req, res) => {
 ========================= */
 
 app.get("/api/devices/summary", (_req, res) => {
-  const list = [...devices.values()];
+  const total = db.prepare(`
+    SELECT COUNT(*) AS count FROM devices
+  `).get().count;
+
+  const online = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM devices
+    WHERE status = 'online'
+  `).get().count;
 
   res.json({
-    total: list.length,
-    online: list.filter(d => d.status === "online").length,
-    offline: list.filter(d => d.status !== "online").length
+    total,
+    online,
+    offline: total - online
   });
 });
 
@@ -212,7 +291,9 @@ app.get("/api/devices/summary", (_req, res) => {
 ========================= */
 
 app.get("/api/devices/:id", (req, res) => {
-  const device = devices.get(String(req.params.id));
+  const device = db.prepare(`
+    SELECT * FROM devices WHERE id = ?
+  `).get(String(req.params.id));
 
   if (!device) {
     return res.status(404).json({
@@ -224,11 +305,31 @@ app.get("/api/devices/:id", (req, res) => {
 });
 
 /* =========================
-   DEMO SMS LIST
+   SMS LOGS — READ ONLY
 ========================= */
 
 app.get("/api/sms", (_req, res) => {
-  res.json([]);
+  const messages = db.prepare(`
+    SELECT *
+    FROM sms_logs
+    ORDER BY created_at DESC
+  `).all();
+
+  res.json(messages);
+});
+
+/* =========================
+   CHECKS
+========================= */
+
+app.get("/api/checks", (_req, res) => {
+  const checks = db.prepare(`
+    SELECT *
+    FROM checks
+    ORDER BY created_at DESC
+  `).all();
+
+  res.json(checks);
 });
 
 /* =========================
@@ -246,7 +347,7 @@ app.get("/api/features", (_req, res) => {
 });
 
 /* =========================
-   LIVE EVENTS
+   EVENTS
 ========================= */
 
 app.get("/api/events", (req, res) => {
@@ -276,7 +377,7 @@ app.get("/api/events", (req, res) => {
 });
 
 /* =========================
-   START SERVER
+   START
 ========================= */
 
 app.listen(PORT, "0.0.0.0", () => {
