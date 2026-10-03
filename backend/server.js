@@ -1,7 +1,19 @@
+cat > server.js <<'EOF'
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
-import Database from "better-sqlite3";
+import initSqlJs from "sql.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createRequire } from "module";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const require = createRequire(import.meta.url);
+const sqlJsPackage = path.dirname(require.resolve("sql.js/package.json"));
+const wasmPath = path.join(sqlJsPackage, "dist", "sql-wasm.wasm");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -17,11 +29,24 @@ app.use(express.json());
    DATABASE
 ========================= */
 
-const db = new Database("daddy-ji.db");
+const dbFile = path.join(__dirname, "daddy-ji.db");
 
-db.pragma("journal_mode = WAL");
+const SQL = await initSqlJs({
+  locateFile: () => wasmPath
+});
 
-db.exec(`
+let db;
+
+if (fs.existsSync(dbFile)) {
+  const data = fs.readFileSync(dbFile);
+  db = new SQL.Database(data);
+  console.log("Existing database loaded.");
+} else {
+  db = new SQL.Database();
+  console.log("New database created.");
+}
+
+db.run(`
   CREATE TABLE IF NOT EXISTS devices (
     id TEXT PRIMARY KEY,
     name TEXT,
@@ -56,6 +81,59 @@ db.exec(`
   );
 `);
 
+function saveDatabase() {
+  const data = db.export();
+  fs.writeFileSync(dbFile, Buffer.from(data));
+}
+
+function run(sql, params = []) {
+  const stmt = db.prepare(sql);
+
+  try {
+    stmt.bind(params);
+    stmt.step();
+  } finally {
+    stmt.free();
+  }
+
+  saveDatabase();
+}
+
+function get(sql, params = []) {
+  const stmt = db.prepare(sql);
+
+  try {
+    stmt.bind(params);
+
+    if (stmt.step()) {
+      return stmt.getAsObject();
+    }
+
+    return null;
+  } finally {
+    stmt.free();
+  }
+}
+
+function all(sql, params = []) {
+  const stmt = db.prepare(sql);
+  const rows = [];
+
+  try {
+    stmt.bind(params);
+
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject());
+    }
+
+    return rows;
+  } finally {
+    stmt.free();
+  }
+}
+
+saveDatabase();
+
 /* =========================
    HEALTH
 ========================= */
@@ -64,8 +142,23 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     database: {
-      driver: "sqlite",
-      connected: true
+      driver: "sql.js",
+      connected: true,
+      persistent: true
+    },
+    fcm: {
+      configured: false
+    }
+  });
+});
+
+app.get("/api/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    database: {
+      driver: "sql.js",
+      connected: true,
+      persistent: true
     },
     fcm: {
       configured: false
@@ -94,20 +187,21 @@ app.post("/api/customer/login", (req, res) => {
     });
   }
 
+  const cleanUsername = String(username).trim();
   const token = crypto.randomUUID();
 
-  db.prepare(`
+  run(`
     INSERT INTO sessions (token, username, created_at)
     VALUES (?, ?, ?)
-  `).run(
+  `, [
     token,
-    String(username).trim(),
+    cleanUsername,
     new Date().toISOString()
-  );
+  ]);
 
   res.json({
     token,
-    username: String(username).trim()
+    username: cleanUsername
   });
 });
 
@@ -122,11 +216,11 @@ function getSession(req) {
     return null;
   }
 
-  return db.prepare(`
+  return get(`
     SELECT token, username, created_at
     FROM sessions
     WHERE token = ?
-  `).get(header.slice(7)) || null;
+  `, [header.slice(7)]);
 }
 
 /* =========================
@@ -168,33 +262,51 @@ app.post("/api/devices/register", (req, res) => {
     });
   }
 
+  const id = String(device_id);
   const now = new Date().toISOString();
 
-  db.prepare(`
-    INSERT INTO devices
-      (id, name, model, battery, app_version, status, last_seen, created_at)
-    VALUES
-      (?, ?, ?, ?, ?, 'online', ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      name = excluded.name,
-      model = excluded.model,
-      battery = excluded.battery,
-      app_version = excluded.app_version,
-      status = 'online',
-      last_seen = excluded.last_seen
-  `).run(
-    String(device_id),
-    model || "Android Device",
-    model || "Unknown",
-    battery != null ? Number(battery) : null,
-    app_version || "unknown",
-    now,
-    now
-  );
+  const existing = get(`
+    SELECT id FROM devices WHERE id = ?
+  `, [id]);
 
-  const device = db.prepare(`
+  if (existing) {
+    run(`
+      UPDATE devices
+      SET name = ?,
+          model = ?,
+          battery = ?,
+          app_version = ?,
+          status = 'online',
+          last_seen = ?
+      WHERE id = ?
+    `, [
+      model || "Android Device",
+      model || "Unknown",
+      battery != null ? Number(battery) : null,
+      app_version || "unknown",
+      now,
+      id
+    ]);
+  } else {
+    run(`
+      INSERT INTO devices
+        (id, name, model, battery, app_version, status, last_seen, created_at)
+      VALUES
+        (?, ?, ?, ?, ?, 'online', ?, ?)
+    `, [
+      id,
+      model || "Android Device",
+      model || "Unknown",
+      battery != null ? Number(battery) : null,
+      app_version || "unknown",
+      now,
+      now
+    ]);
+  }
+
+  const device = get(`
     SELECT * FROM devices WHERE id = ?
-  `).get(String(device_id));
+  `, [id]);
 
   res.json({
     ok: true,
@@ -209,9 +321,9 @@ app.post("/api/devices/register", (req, res) => {
 app.post("/api/devices/:id/heartbeat", (req, res) => {
   const id = String(req.params.id);
 
-  const exists = db.prepare(`
+  const exists = get(`
     SELECT id FROM devices WHERE id = ?
-  `).get(id);
+  `, [id]);
 
   if (!exists) {
     return res.status(404).json({
@@ -219,31 +331,35 @@ app.post("/api/devices/:id/heartbeat", (req, res) => {
     });
   }
 
-  const battery =
-    req.body?.battery !== undefined
-      ? Number(req.body.battery)
-      : null;
+  const now = new Date().toISOString();
 
-  if (battery !== null) {
-    db.prepare(`
+  if (req.body?.battery !== undefined) {
+    run(`
       UPDATE devices
       SET battery = ?,
           status = 'online',
           last_seen = ?
       WHERE id = ?
-    `).run(battery, new Date().toISOString(), id);
+    `, [
+      Number(req.body.battery),
+      now,
+      id
+    ]);
   } else {
-    db.prepare(`
+    run(`
       UPDATE devices
       SET status = 'online',
           last_seen = ?
       WHERE id = ?
-    `).run(new Date().toISOString(), id);
+    `, [
+      now,
+      id
+    ]);
   }
 
-  const device = db.prepare(`
+  const device = get(`
     SELECT * FROM devices WHERE id = ?
-  `).get(id);
+  `, [id]);
 
   res.json({
     ok: true,
@@ -256,10 +372,10 @@ app.post("/api/devices/:id/heartbeat", (req, res) => {
 ========================= */
 
 app.get("/api/devices", (_req, res) => {
-  const devices = db.prepare(`
+  const devices = all(`
     SELECT * FROM devices
     ORDER BY last_seen DESC
-  `).all();
+  `);
 
   res.json(devices);
 });
@@ -269,15 +385,18 @@ app.get("/api/devices", (_req, res) => {
 ========================= */
 
 app.get("/api/devices/summary", (_req, res) => {
-  const total = db.prepare(`
+  const totalRow = get(`
     SELECT COUNT(*) AS count FROM devices
-  `).get().count;
+  `);
 
-  const online = db.prepare(`
+  const onlineRow = get(`
     SELECT COUNT(*) AS count
     FROM devices
     WHERE status = 'online'
-  `).get().count;
+  `);
+
+  const total = Number(totalRow?.count || 0);
+  const online = Number(onlineRow?.count || 0);
 
   res.json({
     total,
@@ -291,9 +410,9 @@ app.get("/api/devices/summary", (_req, res) => {
 ========================= */
 
 app.get("/api/devices/:id", (req, res) => {
-  const device = db.prepare(`
+  const device = get(`
     SELECT * FROM devices WHERE id = ?
-  `).get(String(req.params.id));
+  `, [String(req.params.id)]);
 
   if (!device) {
     return res.status(404).json({
@@ -309,11 +428,11 @@ app.get("/api/devices/:id", (req, res) => {
 ========================= */
 
 app.get("/api/sms", (_req, res) => {
-  const messages = db.prepare(`
+  const messages = all(`
     SELECT *
     FROM sms_logs
     ORDER BY created_at DESC
-  `).all();
+  `);
 
   res.json(messages);
 });
@@ -323,11 +442,11 @@ app.get("/api/sms", (_req, res) => {
 ========================= */
 
 app.get("/api/checks", (_req, res) => {
-  const checks = db.prepare(`
+  const checks = all(`
     SELECT *
     FROM checks
     ORDER BY created_at DESC
-  `).all();
+  `);
 
   res.json(checks);
 });
@@ -382,4 +501,6 @@ app.get("/api/events", (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Database: ${dbFile}`);
 });
+EOF
